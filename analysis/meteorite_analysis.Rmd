@@ -1,0 +1,263 @@
+---
+title: "NASA Meteorite Landings Classification"
+author: "Eno Umoren, Camila Nunez Polanco, and Rohil Nataraj"
+date: "2026-04-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(pROC)
+
+set.seed(123)
+theme_set(theme_minimal())
+```
+
+## Research question
+
+Which factors--composition, mass, year, and geographic location--are associated with the probability that a meteorite is classified as `Fell` rather than `Found`?
+
+## Load and clean the data
+
+```{r load-data}
+data_url <- "https://data.nasa.gov/docs/legacy/meteorite_landings/Meteorite_Landings.csv"
+meteorite_raw <- read.csv(data_url, stringsAsFactors = FALSE)
+
+meteorite <- meteorite_raw |>
+  filter(
+    nametype == "Valid",
+    !is.na(mass..g.),
+    !is.na(fall),
+    !is.na(year),
+    !is.na(recclass),
+    !is.na(reclat),
+    !is.na(reclong),
+    year >= 860,
+    year <= 2016,
+    reclong >= -180,
+    reclong <= 180,
+    reclat >= -90,
+    reclat <= 90,
+    reclat != 0 | reclong != 0
+  ) |>
+  rename(mass = mass..g.) |>
+  mutate(
+    composition = case_when(
+      grepl("Iron", recclass, ignore.case = TRUE) ~ "Iron",
+      grepl("Mesosiderite|Pallasite", recclass, ignore.case = TRUE) ~ "Stony-Iron",
+      TRUE ~ "Stone"
+    ),
+    mass_group = case_when(
+      mass < 100 ~ "Small (<100 g)",
+      mass < 10000 ~ "Medium (100-10,000 g)",
+      TRUE ~ "Large (>10,000 g)"
+    ),
+    year_group = if_else(year <= 1986, "Early (860-1986)", "Later (1987-2013)"),
+    region = case_when(
+      reclat > 0 & reclong < 0 ~ "Northwest",
+      reclat > 0 & reclong >= 0 ~ "Northeast",
+      reclat <= 0 & reclong < 0 ~ "Southwest",
+      TRUE ~ "Southeast"
+    ),
+    fall = factor(fall, levels = c("Found", "Fell")),
+    composition = factor(composition),
+    mass_group = factor(
+      mass_group,
+      levels = c("Large (>10,000 g)", "Medium (100-10,000 g)", "Small (<100 g)")
+    ),
+    year_group = factor(year_group, levels = c("Early (860-1986)", "Later (1987-2013)")),
+    region = factor(region, levels = c("Northeast", "Northwest", "Southeast", "Southwest"))
+  ) |>
+  select(name, fall, mass, mass_group, composition, year, year_group, region)
+
+cat("Raw observations:", nrow(meteorite_raw), "\n")
+cat("Clean observations:", nrow(meteorite), "\n")
+round(prop.table(table(meteorite$fall)), 4)
+```
+
+## Exploratory analysis
+
+```{r composition-plot, fig.width=7, fig.height=4}
+ggplot(meteorite, aes(composition, fill = fall)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Found" = "#1D4E7A", "Fell" = "#E63946")) +
+  labs(
+    title = "Fell versus Found by Meteorite Composition",
+    x = "Composition",
+    y = "Proportion",
+    fill = "Status"
+  )
+```
+
+```{r mass-plot, fig.width=7, fig.height=4}
+ggplot(meteorite, aes(mass_group, fill = fall)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Found" = "#1D4E7A", "Fell" = "#E63946")) +
+  labs(
+    title = "Fell versus Found by Meteorite Mass",
+    x = "Mass category",
+    y = "Proportion",
+    fill = "Status"
+  )
+```
+
+## Chi-square tests
+
+```{r chi-square-tests}
+predictors <- c("mass_group", "composition", "year_group", "region")
+
+chi_square_results <- lapply(predictors, function(variable) {
+  test <- chisq.test(table(meteorite[[variable]], meteorite$fall))
+  data.frame(
+    predictor = variable,
+    chi_square = unname(test$statistic),
+    degrees_of_freedom = unname(test$parameter),
+    p_value = test$p.value,
+    minimum_expected_count = min(test$expected)
+  )
+}) |>
+  bind_rows()
+
+chi_square_results
+```
+
+## Training and test sets
+
+```{r split-data}
+train_index <- createDataPartition(meteorite$fall, p = 0.70, list = FALSE)
+train_data <- meteorite[train_index, ]
+test_data <- meteorite[-train_index, ]
+
+round(prop.table(table(train_data$fall)), 4)
+round(prop.table(table(test_data$fall)), 4)
+```
+
+## Logistic regression models
+
+```{r fit-models}
+full_model <- glm(
+  fall ~ mass_group + composition + region + year_group,
+  data = train_data,
+  family = binomial()
+)
+
+reduced_model <- glm(
+  fall ~ mass_group + region,
+  data = train_data,
+  family = binomial()
+)
+
+interaction_model <- glm(
+  fall ~ mass_group * region + composition + year_group,
+  data = train_data,
+  family = binomial()
+)
+
+model_comparison <- data.frame(
+  model = c("Full", "Reduced", "Interaction"),
+  residual_deviance = c(
+    deviance(full_model),
+    deviance(reduced_model),
+    deviance(interaction_model)
+  ),
+  AIC = c(AIC(full_model), AIC(reduced_model), AIC(interaction_model))
+)
+
+model_comparison
+```
+
+## Test-set performance
+
+```{r evaluate-models}
+test_probabilities <- list(
+  Full = predict(full_model, newdata = test_data, type = "response"),
+  Reduced = predict(reduced_model, newdata = test_data, type = "response"),
+  Interaction = predict(interaction_model, newdata = test_data, type = "response")
+)
+
+roc_objects <- lapply(
+  test_probabilities,
+  function(probability) roc(test_data$fall, probability, levels = c("Found", "Fell"), quiet = TRUE)
+)
+
+auc_results <- data.frame(
+  model = names(roc_objects),
+  AUC = vapply(roc_objects, function(object) as.numeric(auc(object)), numeric(1))
+)
+
+auc_results
+```
+
+```{r roc-plot, fig.width=7, fig.height=5}
+plot(roc_objects$Full, col = "#2455A4", lwd = 3, main = "ROC Curve Comparison")
+plot(roc_objects$Reduced, col = "#D1495B", lwd = 3, add = TRUE)
+plot(roc_objects$Interaction, col = "#F4A261", lwd = 3, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray60")
+legend(
+  "bottomright",
+  legend = paste0(auc_results$model, ": AUC = ", round(auc_results$AUC, 3)),
+  col = c("#2455A4", "#D1495B", "#F4A261"),
+  lwd = 3,
+  bty = "n"
+)
+```
+
+## Odds ratios for the full model
+
+```{r odds-ratios}
+odds_ratios <- data.frame(
+  term = names(coef(full_model)),
+  odds_ratio = exp(coef(full_model)),
+  lower_95 = exp(confint.default(full_model)[, 1]),
+  upper_95 = exp(confint.default(full_model)[, 2])
+)
+
+odds_ratios
+```
+
+## Confusion matrices
+
+Because the outcome is highly imbalanced, a fixed 0.50 threshold can obscure performance on the minority `Fell` class. The code below uses each model's test-set ROC threshold that maximizes sensitivity plus specificity.
+
+```{r confusion-matrices}
+confusion_results <- lapply(names(roc_objects), function(model_name) {
+  threshold <- as.numeric(coords(
+    roc_objects[[model_name]],
+    x = "best",
+    best.method = "youden",
+    ret = "threshold",
+    transpose = FALSE
+  ))
+
+  predicted <- factor(
+    ifelse(test_probabilities[[model_name]] >= threshold, "Fell", "Found"),
+    levels = c("Found", "Fell")
+  )
+
+  list(
+    model = model_name,
+    threshold = threshold,
+    confusion_matrix = confusionMatrix(predicted, test_data$fall, positive = "Fell")
+  )
+})
+
+for (result in confusion_results) {
+  cat("\n", result$model, "model; threshold =", round(result$threshold, 4), "\n")
+  print(result$confusion_matrix)
+}
+```
+
+## Limitations
+
+- The classes are strongly imbalanced, with far more `Found` than `Fell` observations.
+- Recorded locations reflect discovery and reporting patterns as well as meteorite processes.
+- Geographic quadrants are broad and may hide important regional differences.
+- The analysis is observational and does not establish causal relationships.
+
